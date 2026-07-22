@@ -214,6 +214,9 @@ class AgentRuntime:
                 call_id = recorded["call_id"]
                 replayed = True
             else:
+                # The request is persisted before lookup, approval, or handler
+                # execution so a crash cannot make a resumed run invent a new
+                # call_id for the same planned action.
                 call_id = new_id("call")
                 self._emit(
                     run_id,
@@ -285,6 +288,9 @@ class AgentRuntime:
                 kind, value = folded.outcomes[call_id]
                 replayed = True  # never re-invoke; may have had side effects
             else:
+                # This is the only point where the outside world may be touched.
+                # Once _execute journals an outcome, every later resume must use
+                # that record instead of calling the handler again.
                 kind, value = self._execute(run_id, call_id, tool, decision.arguments)
 
             outcome_field = {"result": value} if kind == "ok" else {"error": value}

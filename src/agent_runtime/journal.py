@@ -133,6 +133,9 @@ class Journal:
                 created_at=event.created_at,
             )
             try:
+                # INSERT-only writes keep recovery auditable: if the process
+                # dies after this commit, replay sees exactly the same prefix
+                # of events and continues from the first missing outcome.
                 self._conn.execute(
                     "INSERT INTO events VALUES (?, ?, ?, ?, ?)", stamped.to_row()
                 )
