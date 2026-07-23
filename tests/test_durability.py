@@ -22,7 +22,7 @@ from agent_runtime import (
     Tool,
     ToolRegistry,
 )
-from agent_runtime.errors import ReplayDivergence
+from agent_runtime.errors import OutcomeResolutionError, ReplayDivergence
 
 
 @pytest.fixture
@@ -105,6 +105,83 @@ def test_resume_does_not_re_execute_effectful_tools(journal):
     assert resumed.replayed is True
 
 
+def test_crash_after_non_idempotent_start_parks_for_evidence_not_retry(journal):
+    from agent_runtime.events import Event, EventType
+
+    decisions = [CallTool("send_email", {"to": "a@b.c"}), Finish(output="done")]
+    runtime, planner, counter = build(journal, decisions)
+    run_id = "run_ambiguous"
+    call_id = "call_ambiguous"
+    journal.create_run(run_id, "email someone", 0.0)
+    journal.append(Event(run_id, EventType.RUN_STARTED, payload={"goal": "email"}))
+    journal.append(
+        Event(
+            run_id,
+            EventType.LLM_RESPONDED,
+            payload={"decision": decisions[0].as_dict()},
+        )
+    )
+    journal.append(
+        Event(
+            run_id,
+            EventType.TOOL_REQUESTED,
+            payload={
+                "call_id": call_id,
+                "name": "send_email",
+                "arguments": {"to": "a@b.c"},
+            },
+        )
+    )
+    journal.append(
+        Event(
+            run_id,
+            EventType.TOOL_EXECUTION_STARTED,
+            payload={
+                "call_id": call_id,
+                "name": "send_email",
+                "attempt": 0,
+                "idempotent": False,
+            },
+        )
+    )
+    counter.sends = 1  # the remote email may have committed before process death
+
+    parked = runtime.advance(run_id)
+    again = runtime.advance(run_id)
+
+    assert parked.status is RunStatus.AWAITING_RECOVERY
+    assert parked.pending_recovery["call_id"] == call_id
+    assert again.status is RunStatus.AWAITING_RECOVERY
+    assert counter.sends == 1
+    assert planner.calls == 0
+    assert (
+        sum(
+            event.type is EventType.TOOL_OUTCOME_UNKNOWN for event in journal.read(run_id)
+        )
+        == 1
+    )
+
+    resolved = runtime.resolve_tool_outcome(
+        run_id,
+        call_id,
+        succeeded=True,
+        result="provider message id msg_123",
+        actor="ops@example.com",
+        evidence={"provider_lookup": "msg_123"},
+    )
+    assert resolved.status is RunStatus.COMPLETED
+    assert counter.sends == 1
+    with pytest.raises(OutcomeResolutionError, match="not awaiting"):
+        runtime.resolve_tool_outcome(
+            run_id,
+            call_id,
+            succeeded=True,
+            result="duplicate resolution",
+            actor="ops@example.com",
+            evidence={"provider_lookup": "msg_123"},
+        )
+
+
 def test_crash_midway_resumes_from_the_journal(journal):
     """Crash after the tool ran but before the run finished."""
     counter = SideEffectCounter()
@@ -144,17 +221,13 @@ def test_approval_gate_suspends_the_run(journal):
 def test_approval_survives_a_process_restart(journal):
     decisions = [CallTool("send_email", {"to": "ceo@corp.com"}), Finish(output="ok")]
     counter = SideEffectCounter()
-    runtime, _, _ = build(
-        journal, decisions, counter=counter, approval=Approval.REQUIRED
-    )
+    runtime, _, _ = build(journal, decisions, counter=counter, approval=Approval.REQUIRED)
     state = runtime.start("email the CEO")
     run_id = state.run_id
     call_id = state.pending_approval["call_id"]
 
     # The approver comes back later, against a different process.
-    fresh, _, _ = build(
-        journal, decisions, counter=counter, approval=Approval.REQUIRED
-    )
+    fresh, _, _ = build(journal, decisions, counter=counter, approval=Approval.REQUIRED)
     resumed = fresh.approve(run_id, call_id, allowed=True, reason="signed off")
 
     assert resumed.status is RunStatus.COMPLETED
@@ -166,9 +239,7 @@ def test_denied_approval_is_feedback_not_a_crash(journal):
         CallTool("send_email", {"to": "ceo@corp.com"}),
         Finish(output="stood down"),
     ]
-    runtime, _, counter = build(
-        journal, decisions, approval=Approval.REQUIRED
-    )
+    runtime, _, counter = build(journal, decisions, approval=Approval.REQUIRED)
     state = runtime.start("email the CEO")
     final = runtime.approve(
         state.run_id,

@@ -38,3 +38,7 @@ class ReplayDivergence(AgentRuntimeError):
     renamed, or step ordering shifted. Failing loudly is the only safe response:
     silently continuing would apply a recorded result to the wrong call.
     """
+
+
+class OutcomeResolutionError(AgentRuntimeError):
+    """An operator tried to resolve a tool call that is not outcome-unknown."""

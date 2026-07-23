@@ -128,3 +128,51 @@ def test_approval_for_unknown_run_returns_404():
     )
 
     assert response.status_code == 404
+
+
+def test_non_idempotent_error_requires_evidence_backed_resolution():
+    journal = Journal()
+    registry = ToolRegistry()
+    registry.register(
+        Tool(
+            name="send",
+            description="Possibly send.",
+            handler=lambda: (_ for _ in ()).throw(TimeoutError("lost response")),
+            idempotent=False,
+        )
+    )
+    client = TestClient(
+        create_app(
+            journal,
+            ScriptedPlanner([CallTool("send"), Finish(output="done")]),
+            registry,
+        )
+    )
+    started = client.post("/runs", json={"goal": "send once"})
+    body = started.json()
+    assert body["status"] == "awaiting_recovery"
+    call_id = body["pending_recovery"]["call_id"]
+
+    missing_evidence = client.post(
+        f"/runs/{body['run_id']}/tool-outcomes",
+        json={
+            "call_id": call_id,
+            "succeeded": False,
+            "actor": "ops",
+            "evidence": {},
+        },
+    )
+    assert missing_evidence.status_code == 422
+
+    resolved = client.post(
+        f"/runs/{body['run_id']}/tool-outcomes",
+        json={
+            "call_id": call_id,
+            "succeeded": False,
+            "actor": "ops",
+            "error": "provider confirms no message",
+            "evidence": {"provider_query": "no matching message id"},
+        },
+    )
+    assert resolved.status_code == 200
+    assert resolved.json()["status"] == "completed"

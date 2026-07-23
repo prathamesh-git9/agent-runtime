@@ -5,14 +5,15 @@ after a crash execute the *same* code path: both fold the existing events into
 state, then continue. There is no separate "recovery" branch to drift out of
 sync with the happy path — recovery correctness is exercised by every normal run.
 
-Two rules make that work:
+Three rules make that work:
 
-1. Every non-deterministic outcome (a planner decision, a tool result, a human
-   approval) is journalled before it is acted on.
+1. Planner decisions and human approvals are journalled before they are acted on;
+   a tool execution-start marker is committed before entering its handler.
 2. On replay, those recorded outcomes are *consumed* instead of re-produced. The
-   planner is not re-asked and effectful tools are not re-executed — which is
-   the entire point. Re-running `charge_card` to rebuild state would be a bug
-   that costs real money.
+   planner is not re-asked and completed tool calls are not re-executed.
+3. A non-idempotent start without an outcome is ambiguous, not retryable. The run
+   stops for authoritative operator evidence because the external commit and
+   local journal append cannot be one transaction.
 
 When the journal runs out of recorded outcomes, the loop transparently goes
 live. That boundary is the only difference between replay and fresh execution.
@@ -26,6 +27,7 @@ from typing import Any
 
 from agent_runtime.errors import (
     MaxStepsExceeded,
+    OutcomeResolutionError,
     ReplayDivergence,
     ToolExecutionError,
     ToolNotFound,
@@ -49,6 +51,7 @@ class RunState:
     output: str | None = None
     error: str | None = None
     pending_approval: dict[str, Any] | None = None
+    pending_recovery: dict[str, Any] | None = None
     steps: int = 0
     transcript: list[dict[str, Any]] = field(default_factory=list)
     # True when this pass served at least one outcome from the journal rather
@@ -66,6 +69,8 @@ class _Folded:
     outcomes: dict[str, tuple[str, str]] = field(default_factory=dict)
     approvals: dict[str, tuple[bool, str]] = field(default_factory=dict)
     attempts: dict[str, int] = field(default_factory=dict)
+    started: dict[str, dict[str, Any]] = field(default_factory=dict)
+    unknown: dict[str, dict[str, Any]] = field(default_factory=dict)
     terminal: tuple[RunStatus, str] | None = None
 
 
@@ -80,6 +85,10 @@ def _fold(events: list[Event]) -> _Folded:
                 f.requests.append(p)
             case EventType.APPROVAL_DECIDED:
                 f.approvals[p["call_id"]] = (p["allowed"], p.get("reason", ""))
+            case EventType.TOOL_EXECUTION_STARTED:
+                f.started[p["call_id"]] = p
+            case EventType.TOOL_OUTCOME_UNKNOWN:
+                f.unknown[p["call_id"]] = p
             case EventType.TOOL_SUCCEEDED:
                 f.outcomes[p["call_id"]] = ("ok", p["result"])
             case EventType.TOOL_FAILED:
@@ -129,6 +138,57 @@ class AgentRuntime:
             EventType.APPROVAL_DECIDED,
             {"call_id": call_id, "allowed": allowed, "reason": reason},
         )
+        return self.advance(run_id)
+
+    def resolve_tool_outcome(
+        self,
+        run_id: str,
+        call_id: str,
+        *,
+        succeeded: bool,
+        actor: str,
+        evidence: dict[str, Any],
+        result: str = "",
+        error: str = "",
+    ) -> RunState:
+        """Record authoritative evidence for one ambiguous external call."""
+        if not actor.strip():
+            raise OutcomeResolutionError("actor is required")
+        if not evidence:
+            raise OutcomeResolutionError("resolution evidence is required")
+        run = self._journal.get_run(run_id)
+        if run is None:
+            from agent_runtime.errors import RunNotFound
+
+            raise RunNotFound(run_id)
+        folded = _fold(self._journal.read(run_id))
+        requested = next(
+            (item for item in folded.requests if item["call_id"] == call_id),
+            None,
+        )
+        if (
+            requested is None
+            or call_id not in folded.started
+            or call_id in folded.outcomes
+        ):
+            raise OutcomeResolutionError(
+                f"tool call {call_id} is not awaiting outcome resolution"
+            )
+        event_type = EventType.TOOL_SUCCEEDED if succeeded else EventType.TOOL_FAILED
+        payload: dict[str, Any] = {
+            "call_id": call_id,
+            "resolved_by": actor,
+            "resolution_evidence": evidence,
+            "manual_resolution": True,
+        }
+        if succeeded:
+            payload["result"] = result
+        else:
+            payload.update(
+                {"error": error or "operator confirmed failure", "final": True}
+            )
+        self._emit(run_id, event_type, payload)
+        self._journal.set_status(run_id, RunStatus.RUNNING, time.time())
         return self.advance(run_id)
 
     def advance(self, run_id: str) -> RunState:
@@ -250,9 +310,7 @@ class AgentRuntime:
                         "arguments": decision.arguments,
                     },
                 )
-                self._journal.set_status(
-                    run_id, RunStatus.AWAITING_APPROVAL, time.time()
-                )
+                self._journal.set_status(run_id, RunStatus.AWAITING_APPROVAL, time.time())
                 return RunState(
                     run_id=run_id,
                     status=RunStatus.AWAITING_APPROVAL,
@@ -276,8 +334,7 @@ class AgentRuntime:
                             "role": "tool",
                             "name": decision.name,
                             "error": (
-                                "denied by human review: "
-                                f"{reason or 'no reason given'}"
+                                f"denied by human review: {reason or 'no reason given'}"
                             ),
                         }
                     )
@@ -287,16 +344,47 @@ class AgentRuntime:
             if call_id in folded.outcomes:
                 kind, value = folded.outcomes[call_id]
                 replayed = True  # never re-invoke; may have had side effects
+            elif call_id in folded.started and not tool.idempotent:
+                # There is proof execution began but no durable proof of its
+                # outcome. The external effect may already exist. Re-firing is
+                # unsafe, regardless of how capable the planner is.
+                if call_id not in folded.unknown:
+                    self._emit(
+                        run_id,
+                        EventType.TOOL_OUTCOME_UNKNOWN,
+                        {
+                            "call_id": call_id,
+                            "name": decision.name,
+                            "reason": "execution_started_without_durable_outcome",
+                        },
+                    )
+                return self._awaiting_recovery(
+                    run_id,
+                    call_id,
+                    decision,
+                    step,
+                    transcript,
+                    replayed=True,
+                )
             else:
                 # This is the only point where the outside world may be touched.
                 # Once _execute journals an outcome, every later resume must use
                 # that record instead of calling the handler again.
                 kind, value = self._execute(run_id, call_id, tool, decision.arguments)
 
+            if kind == "unknown":
+                return self._awaiting_recovery(
+                    run_id,
+                    call_id,
+                    decision,
+                    step,
+                    transcript,
+                    replayed=replayed,
+                    reason=value,
+                )
+
             outcome_field = {"result": value} if kind == "ok" else {"error": value}
-            transcript.append(
-                {"role": "tool", "name": decision.name, **outcome_field}
-            )
+            transcript.append({"role": "tool", "name": decision.name, **outcome_field})
             self._journal.set_status(run_id, RunStatus.RUNNING, time.time())
 
         error = f"exceeded max_steps={self._max_steps} without finishing"
@@ -308,12 +396,35 @@ class AgentRuntime:
         self, run_id: str, call_id: str, tool, arguments: dict
     ) -> tuple[str, str]:
         last_error = ""
-        for attempt in range(self._max_retries + 1):
+        max_attempts = self._max_retries + 1 if tool.idempotent else 1
+        for attempt in range(max_attempts):
+            self._emit(
+                run_id,
+                EventType.TOOL_EXECUTION_STARTED,
+                {
+                    "call_id": call_id,
+                    "name": tool.name,
+                    "attempt": attempt,
+                    "idempotent": tool.idempotent,
+                },
+            )
             try:
                 result = tool.handler(**arguments)
             except Exception as exc:  # noqa: BLE001 - tool code is untrusted
                 last_error = f"{type(exc).__name__}: {exc}"
-                final = attempt == self._max_retries
+                if not tool.idempotent:
+                    self._emit(
+                        run_id,
+                        EventType.TOOL_OUTCOME_UNKNOWN,
+                        {
+                            "call_id": call_id,
+                            "name": tool.name,
+                            "reason": "non_idempotent_handler_raised",
+                            "error": last_error,
+                        },
+                    )
+                    return "unknown", last_error
+                final = attempt == max_attempts - 1
                 self._emit(
                     run_id,
                     EventType.TOOL_FAILED,
@@ -336,6 +447,32 @@ class AgentRuntime:
             )
             return "ok", text
         return "error", last_error  # pragma: no cover - loop always returns
+
+    def _awaiting_recovery(
+        self,
+        run_id: str,
+        call_id: str,
+        decision: CallTool,
+        step: int,
+        transcript: list[dict[str, Any]],
+        *,
+        replayed: bool,
+        reason: str = "outcome is unknown after interrupted execution",
+    ) -> RunState:
+        self._journal.set_status(run_id, RunStatus.AWAITING_RECOVERY, time.time())
+        return RunState(
+            run_id=run_id,
+            status=RunStatus.AWAITING_RECOVERY,
+            pending_recovery={
+                "call_id": call_id,
+                "name": decision.name,
+                "arguments": decision.arguments,
+                "reason": reason,
+            },
+            steps=step,
+            transcript=transcript,
+            replayed=replayed,
+        )
 
     # -- helpers ------------------------------------------------------------
 

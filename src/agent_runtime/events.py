@@ -25,6 +25,8 @@ class EventType(StrEnum):
     TOOL_REQUESTED = "tool_requested"
     APPROVAL_REQUESTED = "approval_requested"
     APPROVAL_DECIDED = "approval_decided"
+    TOOL_EXECUTION_STARTED = "tool_execution_started"
+    TOOL_OUTCOME_UNKNOWN = "tool_outcome_unknown"
     TOOL_SUCCEEDED = "tool_succeeded"
     TOOL_FAILED = "tool_failed"
     RUN_COMPLETED = "run_completed"
@@ -36,6 +38,10 @@ class RunStatus(StrEnum):
     # Suspended is a first-class resting state, not an error: a run parked on an
     # approval gate may sit here for days across process restarts.
     AWAITING_APPROVAL = "awaiting_approval"
+    # A non-idempotent handler started but no durable outcome exists. Retrying
+    # could duplicate an external effect, so only evidence-backed resolution
+    # may advance the run.
+    AWAITING_RECOVERY = "awaiting_recovery"
     COMPLETED = "completed"
     FAILED = "failed"
 

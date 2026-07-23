@@ -4,10 +4,10 @@ Agent runs are long and flaky. A crash in the middle of a run can lose all
 state, re-spend tokens, and re-fire side effects like refunds, emails, or ticket
 updates.
 
-`agent-runtime` applies Temporal-style durable execution to tool-calling agent
-loops. Every non-deterministic outcome, including planner decisions, tool
-results, and human approvals, is journalled before it is acted on. On resume,
-those outcomes are replayed rather than produced again.
+`agent-runtime` applies event-sourced recovery to tool-calling agent loops.
+Planner decisions, tool execution starts and outcomes, and human approvals are
+journalled. Recorded outcomes replay; an interrupted non-idempotent call with no
+durable outcome stops for evidence-backed recovery instead of being called twice.
 
 ```text
           +------------------+
@@ -42,13 +42,17 @@ a run folds those events into a `RunState`, then continues the loop from the
 first missing outcome.
 
 Planner decisions are recorded as `LLM_RESPONDED` before the chosen action is
-used. Tool calls are recorded as `TOOL_REQUESTED`, then their success or failure
-is recorded. Human decisions are recorded as `APPROVAL_DECIDED`.
+used. Tool calls record `TOOL_EXECUTION_STARTED` before handler I/O, then their
+success or failure. Human decisions are recorded as `APPROVAL_DECIDED`.
 
 Tools have an `idempotent` flag. Idempotent tools are safe to call repeatedly in
 principle. Effectful tools, such as refunds and emails, should set
-`idempotent=False`; their recorded result is replayed on resume rather than
-running the handler again.
+`idempotent=False`; their recorded result is replayed on resume. If execution
+started but the process died before recording an outcome, the runtime cannot
+distinguish "never committed" from "committed but acknowledgement was lost".
+It therefore enters `awaiting_recovery` and requires an operator to attach
+authoritative evidence. This is honest at-most-once recovery, not an impossible
+unconditional exactly-once claim.
 
 ## Approval Gates
 
@@ -93,6 +97,7 @@ factory target.
 | `GET` | `/runs/{id}/events` | Fetch journal events for a run. |
 | `POST` | `/runs/{id}/advance` | Drive an existing run forward. |
 | `POST` | `/runs/{id}/approvals` | Record an approval decision and resume. |
+| `POST` | `/runs/{id}/tool-outcomes` | Resolve an ambiguous tool outcome with actor and evidence. |
 
 ## Testing
 

@@ -12,7 +12,13 @@ from typing import Any
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from agent_runtime.errors import MaxStepsExceeded, ReplayDivergence, RunNotFound
+from agent_runtime.errors import (
+    ConcurrentAppend,
+    MaxStepsExceeded,
+    OutcomeResolutionError,
+    ReplayDivergence,
+    RunNotFound,
+)
 from agent_runtime.events import RunStatus
 from agent_runtime.journal import Journal
 from agent_runtime.runtime import AgentRuntime
@@ -29,6 +35,15 @@ class ApprovalDecision(BaseModel):
     reason: str = ""
 
 
+class ToolOutcomeDecision(BaseModel):
+    call_id: str
+    succeeded: bool
+    actor: str = Field(min_length=1)
+    evidence: dict[str, Any] = Field(min_length=1)
+    result: str = ""
+    error: str = ""
+
+
 def _state_payload(state) -> dict[str, Any]:
     return {
         "run_id": state.run_id,
@@ -36,6 +51,7 @@ def _state_payload(state) -> dict[str, Any]:
         "output": state.output,
         "error": state.error,
         "pending_approval": state.pending_approval,
+        "pending_recovery": state.pending_recovery,
         "steps": state.steps,
         "replayed": state.replayed,
         "transcript": state.transcript,
@@ -104,6 +120,26 @@ def create_app(journal: Journal, planner, registry: ToolRegistry, **kwargs) -> F
             )
         except MaxStepsExceeded as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from None
+        return _state_payload(state)
+
+    @app.post("/runs/{run_id}/tool-outcomes")
+    async def resolve_tool_outcome(run_id: str, body: ToolOutcomeDecision) -> dict:
+        try:
+            state = runtime.resolve_tool_outcome(
+                run_id,
+                body.call_id,
+                succeeded=body.succeeded,
+                actor=body.actor,
+                evidence=body.evidence,
+                result=body.result,
+                error=body.error,
+            )
+        except RunNotFound:
+            raise HTTPException(
+                status_code=404, detail=f"no such run: {run_id}"
+            ) from None
+        except (OutcomeResolutionError, ConcurrentAppend) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from None
         return _state_payload(state)
 
     return app

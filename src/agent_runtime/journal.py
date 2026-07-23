@@ -30,6 +30,10 @@ CREATE TABLE IF NOT EXISTS events (
     PRIMARY KEY (run_id, seq)
 );
 CREATE INDEX IF NOT EXISTS idx_events_run ON events(run_id, seq);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_events_terminal_tool_outcome
+ON events(run_id, json_extract(payload, '$.call_id'))
+WHERE type = 'tool_succeeded'
+   OR (type = 'tool_failed' AND json_extract(payload, '$.final') = 1);
 
 CREATE TABLE IF NOT EXISTS runs (
     run_id     TEXT PRIMARY KEY,

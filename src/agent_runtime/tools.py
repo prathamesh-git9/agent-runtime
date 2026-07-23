@@ -2,8 +2,9 @@
 
 A tool declares whether it is *safe to replay*. That flag is the crux of durable
 execution: replaying `read_file` costs nothing, but replaying `send_email` sends
-a second email. Effectful tools must therefore have their results served from
-the journal on resume and never re-invoked — see `runtime.py`.
+a second email. Effectful tools have recorded results served from the journal;
+if no result exists after a recorded start, they stop for recovery rather than
+being re-invoked — see `runtime.py`.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ from agent_runtime.errors import ToolNotFound
 
 
 class Approval(StrEnum):
-    AUTO = "auto"          # run without asking
+    AUTO = "auto"  # run without asking
     REQUIRED = "required"  # suspend the run until a human decides
 
 
@@ -27,9 +28,9 @@ class Tool:
     description: str
     handler: Callable[..., Any]
     approval: Approval = Approval.AUTO
-    # False for anything with a side effect the world can observe. Effectful
-    # tools are still durable — their recorded result is replayed — but they
-    # must never be re-executed to reconstruct state.
+    # False for anything with a side effect the world can observe. A recorded
+    # result is replayed, but a started call with no durable outcome is parked
+    # for recovery because the runtime cannot know whether the effect committed.
     idempotent: bool = True
     parameters: dict[str, str] = field(default_factory=dict)
 
